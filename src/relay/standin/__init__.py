@@ -1,0 +1,2 @@
+"""Stand-in model service."""
+
