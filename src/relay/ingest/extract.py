@@ -19,6 +19,13 @@ class SectionHeading:
 
 
 @dataclass(frozen=True)
+class SectionSpan:
+    start: int
+    end: int
+    section: str
+
+
+@dataclass(frozen=True)
 class PageText:
     page_index: int
     page_number: int
@@ -26,6 +33,8 @@ class PageText:
     headings: tuple[SectionHeading, ...]
     dropped_blocks: int = 0
     section: str = "unknown"
+    section_spans: tuple[SectionSpan, ...] = ()
+    running_headers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,12 +73,20 @@ _TABLE_MARKERS = frozenset("●◐✓✗")
 _EQUATION_MARKERS = frozenset("∑√ℰℳ𝐿")
 
 
-def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
+def _block_from_raw(
+    raw: dict[str, Any],
+    excluded_headers: frozenset[str] = frozenset(),
+) -> _Block | None:
     lines: list[_Line] = []
     for raw_line in raw.get("lines", []):
         spans = raw_line.get("spans", [])
         if not spans:
             continue
+        raw_line_text = "".join(str(span.get("text", "")) for span in spans).strip()
+        if raw_line_text in excluded_headers:
+            continue
+        dominant_span = max(spans, key=lambda span: float(span.get("size", 0.0)))
+        dominant_baseline = float(dominant_span.get("origin", (0.0, 0.0))[1])
         text_parts: list[str] = []
         index = 0
         while index < len(spans):
@@ -93,6 +110,28 @@ def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
             next_text = (
                 str(spans[index].get("text", "")) if index < len(spans) else ""
             )
+            run_origins = [
+                float(candidate.get("origin", (0.0, 0.0))[1])
+                for candidate in spans[index - len(run) : index]
+            ]
+            clearly_raised = (
+                run_origins
+                and dominant_baseline - min(run_origins) >= 1.5
+                and len(value.strip()) < 8
+            )
+            clearly_lowered = (
+                run_origins
+                and max(run_origins) - dominant_baseline >= 1.5
+                and max(
+                    float(candidate.get("size", 0.0))
+                    for candidate in spans[index - len(run) : index]
+                )
+                < float(dominant_span.get("size", 0.0)) * 0.9
+            )
+            in_math_italic = any(
+                0x1D400 <= ord(character) <= 0x1D7FF
+                for character in value
+            )
             if (
                 previous
                 and previous[-1].isalpha()
@@ -101,10 +140,17 @@ def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
             ):
                 text_parts.append(value)
                 continue
+            if (not clearly_raised and not clearly_lowered) or in_math_italic:
+                text_parts.append(value)
+                continue
+            if clearly_raised and value.strip().isdigit() and previous.endswith("="):
+                text_parts.append(value)
+                continue
             leading = value[: len(value) - len(value.lstrip())]
             trailing = value[len(value.rstrip()) :]
             core = value.strip()
-            text_parts.append(f"{leading}^{{{core}}}{trailing}")
+            marker = "^" if clearly_raised else "_"
+            text_parts.append(f"{leading}{marker}{{{core}}}{trailing}")
         text = "".join(text_parts).strip()
         if not text:
             continue
@@ -133,11 +179,14 @@ def _is_figure_block(block: _Block) -> bool:
     )
 
 
-def _ordered_blocks(page: pymupdf.Page) -> tuple[list[_Block], int]:
+def _ordered_blocks(
+    page: pymupdf.Page,
+    excluded_headers: frozenset[str] = frozenset(),
+) -> tuple[list[_Block], int]:
     blocks = [
         block
         for raw in page.get_text("dict")["blocks"]
-        if (block := _block_from_raw(raw)) is not None
+        if (block := _block_from_raw(raw, excluded_headers)) is not None
     ]
     dropped = sum(_is_figure_block(block) for block in blocks)
     blocks = [block for block in blocks if not _is_figure_block(block)]
@@ -321,17 +370,47 @@ def extract_pdf(path: Path | str) -> list[PageText]:
     """
     pages: list[PageText] = []
     with pymupdf.open(Path(path)) as document:
+        header_counts: dict[tuple[str, float], int] = {}
+        for page in document:
+            seen: set[tuple[str, float]] = set()
+            for raw in page.get_text("dict")["blocks"]:
+                for line in raw.get("lines", []):
+                    text = "".join(
+                        str(span.get("text", "")) for span in line.get("spans", [])
+                    ).strip()
+                    if text and float(line["bbox"][1]) <= 100:
+                        seen.add((text, round(float(line["bbox"][1]), 1)))
+            for key in seen:
+                header_counts[key] = header_counts.get(key, 0) + 1
+        repeated_headers = {
+            text
+            for (text, _), count in header_counts.items()
+            if len(document) > 1 and count > len(document) / 2
+        }
         outline = {
             (_outline_title(title), page)
             for _, title, page in document.get_toc()
         }
         active_section = "unknown"
         for page_index, page in enumerate(document):
-            blocks, dropped = _ordered_blocks(page)
+            blocks, dropped = _ordered_blocks(
+                page, frozenset(repeated_headers)
+            )
             text = "\n".join(block.text for block in blocks)
             headings = _filter_headings(
                 _headings(blocks, text), page_index + 1, outline
             )
+            section_spans: list[SectionSpan] = []
+            cursor = 0
+            for heading in headings:
+                if cursor < heading.start:
+                    section_spans.append(
+                        SectionSpan(cursor, heading.start, active_section)
+                    )
+                active_section = heading.title
+                cursor = heading.start
+            if cursor < len(text):
+                section_spans.append(SectionSpan(cursor, len(text), active_section))
             if headings:
                 active_section = headings[-1].title
             pages.append(
@@ -342,6 +421,8 @@ def extract_pdf(path: Path | str) -> list[PageText]:
                     headings=headings,
                     dropped_blocks=dropped,
                     section=active_section,
+                    section_spans=tuple(section_spans),
+                    running_headers=tuple(sorted(repeated_headers)),
                 )
             )
     return pages
@@ -359,4 +440,13 @@ def page_to_dict(page: PageText) -> dict[str, Any]:
             {"title": heading.title, "start": heading.start, "end": heading.end}
             for heading in page.headings
         ],
+        "section_spans": [
+            {
+                "start": span.start,
+                "end": span.end,
+                "section": span.section,
+            }
+            for span in page.section_spans
+        ],
+        "running_headers": list(page.running_headers),
     }

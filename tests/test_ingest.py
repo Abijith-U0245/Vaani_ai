@@ -103,6 +103,107 @@ def test_chunking_is_deterministic() -> None:
     first = chunk_pages([page], "paper", chunk_size=19, overlap=4)
     second = chunk_pages([page], "paper", chunk_size=19, overlap=4)
     assert first == second
+    assert first[0].search_text == first[0].text
+
+
+def test_search_text_dehyphenates_line_breaks_without_changing_chunk_text() -> None:
+    page = PageText(
+        page_index=0,
+        page_number=1,
+        text="transfor-\nmation speech-to-\nspeech",
+        headings=(),
+    )
+    chunk = chunk_pages([page], "paper", chunk_size=100, overlap=0)[0]
+    assert chunk.text == "transfor-\nmation speech-to-\nspeech"
+    assert chunk.search_text == "transformation speech-to-speech"
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists(),
+    reason="downloaded paper PDF is not present",
+)
+def test_running_headers_are_removed_and_metadata_retained() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    pages = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
+    assert pages[0].running_headers
+    header = pages[0].running_headers[0]
+    assert sum(header in page.text for page in pages) == 0
+    assert all(header in page.running_headers for page in pages)
+    for page in pages:
+        for chunk in chunk_pages([page], "paper"):
+            assert chunk.text == page.text[chunk.start : chunk.end]
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists()
+    or not (PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf").exists(),
+    reason="downloaded paper PDFs are not present",
+)
+def test_chunks_use_offset_section_spans_on_multi_heading_pages() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    cases = (
+        ("2410.00037v1.pdf", 53, "Appendix A.", "Appendix B."),
+        ("2507.07955v2.pdf", 35, "Appendix B", "Appendix C"),
+        ("2507.07955v2.pdf", 36, "Appendix D", "Appendix E"),
+    )
+    for filename, page_number, first, second in cases:
+        page = extract_pdf(PROJECT_ROOT / "data/pdfs" / filename)[page_number - 1]
+        chunks = chunk_pages(
+            [page],
+            filename.split("v")[0],
+            chunk_size=600,
+            overlap=0,
+        )
+        sections = {chunk.section for chunk in chunks}
+        assert any(section.startswith(first) for section in sections)
+        assert any(section.startswith(second) for section in sections)
+        assert all(
+            chunk.section.startswith(("References", "Appendix"))
+            for chunk in chunks
+        )
+        if page_number == 53:
+            assert all(
+                not (
+                    "Additional ablation" in chunk.text
+                    and chunk.section.startswith("References")
+                )
+                and not (
+                    "Additional ablation" in chunk.text
+                    and chunk.section.startswith("Appendix B")
+                )
+                for chunk in chunks
+            )
+        if page_number == 35:
+            assert all(
+                not (
+                    "FLOPs Computation" in chunk.text
+                    and chunk.section.startswith("Appendix A")
+                )
+                for chunk in chunks
+            )
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf").exists()
+    or not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists()
+    or not (PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf").exists(),
+    reason="downloaded paper PDFs are not present",
+)
+def test_superscripts_are_short_and_geometry_grounded() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    attention = extract_pdf(PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf")
+    moshi = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
+    hnet = extract_pdf(PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf")
+    assert "10^{20}" in attention[7].text
+    assert "10^{18}" in attention[7].text
+    assert "O(n^{2}" in attention[5].text
+    assert "10^{−6}" in "\n".join(page.text for page in moshi)
+    assert "^{((" not in hnet[7].text
+    assert "𝜆^{𝑠}" not in hnet[34].text
+    assert "𝐹= 𝐺= ^{1}" not in hnet[7].text
 
 
 def test_two_column_pdf_order_and_page_index(tmp_path: Path) -> None:
