@@ -50,7 +50,7 @@ _NUMBERED_HEADING = re.compile(
 )
 _NUMBER_ONLY = re.compile(rf"^(?P<number>{_NUMBER})\.?$")
 _APPENDIX_HEADING = re.compile(
-    r"^Appendix\s+(?P<number>[A-Z](?:\.\d+)*)\.\s+(?P<title>[A-Za-z][A-Za-z0-9 :,'()\-–—/&]+)$",
+    r"^Appendix\s+(?P<number>[A-Z](?:\.\d+)*)(?:\.\s*|\s+)(?P<title>[A-Za-z][A-Za-z0-9 :,'()\-–—/&]+)$",
     re.IGNORECASE,
 )
 _APPENDIX_ONLY = re.compile(r"^(?:Appendix\s+)?(?P<number>[A-Z])\.?$", re.IGNORECASE)
@@ -60,6 +60,8 @@ _COMMON_HEADING = re.compile(
 )
 _CAPTION = re.compile(r"^(?:FIGURE|TABLE)\s+\d+\b", re.IGNORECASE)
 _UNIT_LINE = re.compile(r"^\d+(?:\.\d+)?\s+(?:HZ|KHZ|MHZ|GB|MB|KB|MS|S)$", re.IGNORECASE)
+_TABLE_MARKERS = frozenset("●◐✓✗")
+_EQUATION_MARKERS = frozenset("∑√ℰℳ𝐿")
 
 
 def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
@@ -68,16 +70,41 @@ def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
         spans = raw_line.get("spans", [])
         if not spans:
             continue
-        # Preserve the PDF text layer exactly. Missing spaces in the source remain missing.
         text_parts: list[str] = []
-        for span in spans:
+        index = 0
+        while index < len(spans):
+            span = spans[index]
             span_text = str(span.get("text", ""))
-            if int(span.get("flags", 0)) & 1 and span_text.strip():
-                leading = span_text[: len(span_text) - len(span_text.lstrip())]
-                trailing = span_text[len(span_text.rstrip()) :]
-                core = span_text.strip()
-                span_text = f"{leading}^{{{core}}}{trailing}"
-            text_parts.append(span_text)
+            is_superscript = bool(int(span.get("flags", 0)) & 1)
+            if not is_superscript or not span_text.strip():
+                text_parts.append(span_text)
+                index += 1
+                continue
+            previous = "".join(text_parts).rstrip()
+            run: list[str] = []
+            while index < len(spans):
+                candidate = spans[index]
+                candidate_text = str(candidate.get("text", ""))
+                if not (int(candidate.get("flags", 0)) & 1):
+                    break
+                run.append(candidate_text)
+                index += 1
+            value = "".join(run)
+            next_text = (
+                str(spans[index].get("text", "")) if index < len(spans) else ""
+            )
+            if (
+                previous
+                and previous[-1].isalpha()
+                and value.strip().isdigit()
+                and next_text.lstrip().startswith(".")
+            ):
+                text_parts.append(value)
+                continue
+            leading = value[: len(value) - len(value.lstrip())]
+            trailing = value[len(value.rstrip()) :]
+            core = value.strip()
+            text_parts.append(f"{leading}^{{{core}}}{trailing}")
         text = "".join(text_parts).strip()
         if not text:
             continue
@@ -96,6 +123,8 @@ def _block_from_raw(raw: dict[str, Any]) -> _Block | None:
 
 
 def _is_figure_block(block: _Block) -> bool:
+    if any(marker in block.text for marker in _TABLE_MARKERS | _EQUATION_MARKERS):
+        return False
     short_lines = sum(len(line.text.strip()) <= 2 for line in block.lines)
     return (
         short_lines >= 1
@@ -252,6 +281,38 @@ def _headings(blocks: list[_Block], text: str) -> tuple[SectionHeading, ...]:
     return tuple(result)
 
 
+def _outline_title(title: str) -> str:
+    return re.sub(
+        r"^(?:Appendix\s+)?(?:\d+(?:\.\d+)*|[A-Z](?:\.\d+)*)\.?\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip().lower()
+
+
+def _filter_headings(
+    headings: tuple[SectionHeading, ...],
+    page_number: int,
+    outline: set[tuple[str, int]],
+) -> tuple[SectionHeading, ...]:
+    filtered: list[SectionHeading] = []
+    for heading in headings:
+        title = heading.title.strip()
+        if title[:1].isdigit():
+            if (_outline_title(title), page_number) not in outline:
+                continue
+        elif title.lower() not in {"abstract", "references"} and not title.lower().startswith(
+            "appendix "
+        ):
+            continue
+        elif title.lower().startswith("appendix ") and (
+            _outline_title(title), page_number
+        ) not in outline:
+            continue
+        filtered.append(heading)
+    return tuple(filtered)
+
+
 def extract_pdf(path: Path | str) -> list[PageText]:
     """Extract pages with normalized text and provenance offsets.
 
@@ -259,19 +320,20 @@ def extract_pdf(path: Path | str) -> list[PageText]:
     superscripts represented as ``^{...}``, not the raw PDF text layer.
     """
     pages: list[PageText] = []
-    active_section = "unknown"
-    saw_references = False
     with pymupdf.open(Path(path)) as document:
+        outline = {
+            (_outline_title(title), page)
+            for _, title, page in document.get_toc()
+        }
+        active_section = "unknown"
         for page_index, page in enumerate(document):
             blocks, dropped = _ordered_blocks(page)
             text = "\n".join(block.text for block in blocks)
-            headings = _headings(blocks, text)
+            headings = _filter_headings(
+                _headings(blocks, text), page_index + 1, outline
+            )
             if headings:
                 active_section = headings[-1].title
-                if active_section.lower() == "references":
-                    saw_references = True
-            elif saw_references and active_section == "References":
-                active_section = "unknown"
             pages.append(
                 PageText(
                     page_index=page_index,

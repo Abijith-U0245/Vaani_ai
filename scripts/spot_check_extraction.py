@@ -38,13 +38,17 @@ def _outline_comparison(document: pymupdf.Document, pages: list) -> None:
         for page in pages
         for heading in page.headings
     }
+    outline = {
+        (_plain_heading(title).lower(), page)
+        for level, title, page in toc
+    }
     numbered_outline = {
-        (title.lower(), page)
+        (_plain_heading(title).lower(), page)
         for level, title, page in toc
         if title[:1].isdigit()
     }
     missing = sorted(numbered_outline - detected)
-    extras = sorted(detected - numbered_outline)
+    extras = sorted(detected - outline)
     recall = (
         (len(numbered_outline) - len(missing)) / len(numbered_outline)
         if numbered_outline
@@ -82,6 +86,39 @@ def _print_regression_lines(document: pymupdf.Document) -> None:
                 print(
                     f"    page={page_number} size={size:.2f} bold={bold} "
                     f"text={text!r} rule={rule}"
+                )
+
+
+def _print_false_positive_diagnostics(
+    document: pymupdf.Document, paper_id: str
+) -> None:
+    targets = (
+        {23: ("kbps",)}
+        if paper_id == "2410.00037"
+        else {36: ("Cross Attention", "KV"), 17: ("x more data efficient than isotropic model",)}
+    )
+    print("  false-positive diagnostics:")
+    for page_number, needles in targets.items():
+        page = document[page_number - 1]
+        sizes = [
+            float(span["size"])
+            for block in page.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        ]
+        dominant = sorted(sizes)[len(sizes) // 2] if sizes else 0.0
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                text = "".join(span["text"] for span in line.get("spans", []))
+                if not any(needle.lower() in text.lower() for needle in needles):
+                    continue
+                size = max(float(span["size"]) for span in line["spans"])
+                bold = any(int(span["flags"]) & 16 for span in line["spans"])
+                bbox = tuple(round(value, 2) for value in block["bbox"])
+                print(
+                    f"    page={page_number} size={size:.2f} bold={bold} "
+                    f"bbox={bbox} text={text!r} "
+                    f"rule=outline-filtered-unless-numbered-match"
                 )
 
 
@@ -162,6 +199,10 @@ def main() -> int:
                     _outline_comparison(document, pages)
                     if paper_id == "2410.00037":
                         _print_regression_lines(document)
+                    if paper_id == "2410.00037":
+                        _print_false_positive_diagnostics(document, paper_id)
+                    if paper_id == "2507.07955":
+                        _print_false_positive_diagnostics(document, paper_id)
                     if paper_id == "1706.03762":
                         _print_superscript_evidence(document)
                 chosen = sorted(rng.sample(range(len(pages)), min(3, len(pages))))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import pymupdf
@@ -193,16 +194,127 @@ def test_attention_unicode_and_superscripts() -> None:
     from relay.ingest.extract import extract_pdf
 
     pages = extract_pdf(PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf")
-    if "•" not in pages[4].text or "∈" not in pages[4].text:
-        pytest.skip(
-            "the downloaded v7 PDF text layer places these glyphs on page 11, "
-            "not PDF page 5"
-        )
     assert "•" in pages[4].text
     assert "∈" in pages[4].text
     assert "10^{20}" in pages[7].text
     assert "10^{18}" in pages[7].text
     assert "O(n^{2}" in pages[5].text
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf").exists(),
+    reason="downloaded paper PDF is not present",
+)
+def test_attention_page_five_preserves_bullet_and_membership() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    text = extract_pdf(PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf")[4].text
+    assert "•" in text
+    assert "∈" in text
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists()
+    or not (PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf").exists(),
+    reason="downloaded paper PDFs are not present",
+)
+def test_false_positive_headings_are_not_detected() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    moshi = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
+    hnet = extract_pdf(PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf")
+    assert "1.5kbps" not in {h.title for h in moshi[22].headings}
+    hnet_p36 = {h.title for h in hnet[35].headings}
+    hnet_p17 = {h.title for h in hnet[16].headings}
+    assert "KV" not in hnet_p36
+    assert "Cross Attention" not in hnet_p36
+    assert "3.6x more data efficient than isotropic model" not in hnet_p17
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists()
+    or not (PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf").exists(),
+    reason="downloaded paper PDFs are not present",
+)
+def test_reference_and_appendix_boundary_sections() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    moshi = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
+    hnet = extract_pdf(PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf")
+    assert moshi[44].section == "References"
+    assert hnet[30].section == "Appendix A Related Work"
+    assert {heading.title for heading in moshi[52].headings} >= {
+        "Appendix A. Additional ablation on Mimi codec",
+        "Appendix B. Audio matching and deduplication",
+    }
+    assert {heading.title for heading in hnet[34].headings} >= {
+        "Appendix B FLOPs Computation",
+        "Appendix C Learning Rate Modulation",
+    }
+
+
+@pytest.mark.skipif(
+    not all(
+        (PROJECT_ROOT / f"data/pdfs/{name}").exists()
+        for name in ("1706.03762v7.pdf", "2410.00037v1.pdf", "2507.07955v2.pdf")
+    ),
+    reason="downloaded paper PDFs are not present",
+)
+def test_non_ascii_counts_match_except_allowlisted_figure_drops() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    # These are isolated diagram/equation glyphs removed by the figure filter.
+    allowed = {
+        # Moshi p14 contains private-use figure glyphs from the PDF's diagram.
+        "2410.00037v1.pdf": {
+            14: {"U+F8F3": 1, "U+F8F4": 1},
+            # These are diagram labels, not prose or equations.
+            56: {"U+23B5": 2},
+            57: {"U+23B5": 1},
+        },
+        "2507.07955v2.pdf": {
+            # These isolated marks belong to the figure on page 3.
+            3: {"U+0302": 1, "U+0305": 2},
+            # This standalone ellipsis is part of the figure on page 38.
+            38: {"U+2026": 1},
+        },
+    }
+    for name in ("1706.03762v7.pdf", "2410.00037v1.pdf", "2507.07955v2.pdf"):
+        with pymupdf.open(PROJECT_ROOT / "data/pdfs" / name) as document:
+            raw_pages = [
+                Counter(ch for ch in page.get_text("text") if ord(ch) > 127)
+                for page in document
+            ]
+        processed_pages = extract_pdf(PROJECT_ROOT / "data/pdfs" / name)
+        differences = {}
+        for page_number, (raw, processed) in enumerate(
+            zip(raw_pages, processed_pages), start=1
+        ):
+            page_diff = {
+                f"U+{ord(ch):04X}": raw[ch] - processed.text.count(ch)
+                for ch in raw
+                if raw[ch] != processed.text.count(ch)
+            }
+            if page_diff:
+                differences[page_number] = page_diff
+        assert differences == allowed.get(name, {})
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf").exists(),
+    reason="downloaded paper PDF is not present",
+)
+def test_negative_exponents_and_footnote_markers() -> None:
+    from relay.ingest.extract import extract_pdf
+
+    pages = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
+    all_text = "\n".join(page.text for page in pages)
+    assert "10^{−6}" in all_text
+    assert "10^{−}^{6}" not in all_text
+
+    attention = extract_pdf(PROJECT_ROOT / "data/pdfs/1706.03762v7.pdf")[7].text
+    assert "GPU 5." in attention
+    assert "GPU ^{5}." not in attention
 
 
 @pytest.mark.skipif(
@@ -215,10 +327,14 @@ def test_appendix_sections_do_not_inherit_references() -> None:
 
     moshi = extract_pdf(PROJECT_ROOT / "data/pdfs/2410.00037v1.pdf")
     hnet = extract_pdf(PROJECT_ROOT / "data/pdfs/2507.07955v2.pdf")
-    assert moshi[44].section == "unknown"
+    assert moshi[44].section == "References"
     assert moshi[58].section.startswith("Appendix")
-    assert hnet[29].section == "unknown"
-    assert hnet[37].section != "References"
+    assert hnet[29].section == "References"
+    assert hnet[37].section.startswith("Appendix")
+    assert all(page.section == "References" for page in moshi[41:52])
+    assert moshi[52].section.startswith("Appendix")
+    assert all(page.section == "References" for page in hnet[24:30])
+    assert hnet[30].section.startswith("Appendix")
 
 
 @pytest.mark.skipif(
